@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import random
+import os.path as op
 
 import numpy as np
 import torch
@@ -38,7 +39,7 @@ def parse_args(args=None):
                         help='Region Id for Countries S1/S2/S3 datasets, DO NOT MANUALLY SET')
     
     parser.add_argument('--data_path', type=str, default=None)
-    parser.add_argument('--model', default='TransE', type=str)
+    parser.add_argument('--model', default='AutoETER', type=str)
     parser.add_argument('-de', '--double_entity_embedding', action='store_true')
     parser.add_argument('-dr', '--double_relation_embedding', action='store_true')
     
@@ -52,18 +53,21 @@ def parse_args(args=None):
     parser.add_argument('--test_batch_size', default=4, type=int, help='valid/test batch size')
     parser.add_argument('--uni_weight', action='store_true', 
                         help='Otherwise use subsampling weighting like in word2vec')
+    parser.add_argument('--multi_path', action='store_true', help='Multiple-relation path in PTransE')
+    parser.add_argument('-max_p', '--max_candidate_paths', type=int, default=16, help='for multiple step relation path')
+    parser.add_argument('-max_s', '--max_path_step', type=int, default=2, help='for multiple step relation path')
     
     parser.add_argument('-lr', '--learning_rate', default=0.0001, type=float)
     parser.add_argument('-cpu', '--cpu_num', default=10, type=int)
     parser.add_argument('-init', '--init_checkpoint', default=None, type=str)
     parser.add_argument('-save', '--save_path', default=None, type=str)
-    parser.add_argument('--max_steps', default=100000, type=int)
+    parser.add_argument('--max_steps', default=300000, type=int)
     parser.add_argument('--warm_up_steps', default=None, type=int)
     
     parser.add_argument('--save_checkpoint_steps', default=10000, type=int)
     parser.add_argument('--valid_steps', default=10000, type=int)
-    parser.add_argument('--log_steps', default=100, type=int, help='train log every xx steps')
-    parser.add_argument('--test_log_steps', default=1000, type=int, help='valid/test log every xx steps')
+    parser.add_argument('--log_steps', default=1000, type=int, help='train log every xx steps')
+    parser.add_argument('--test_log_steps', default=15000, type=int, help='valid/test log every xx steps')
     
     parser.add_argument('--nentity', type=int, default=0, help='DO NOT MANUALLY SET')
     parser.add_argument('--nrelation', type=int, default=0, help='DO NOT MANUALLY SET')
@@ -138,6 +142,47 @@ def read_triple(file_path, entity2id, relation2id):
             h, r, t = line.strip().split('\t')
             triples.append((entity2id[h], relation2id[r], entity2id[t]))
     return triples
+
+def read_triple_multi_path(file_path, conf_path, entity2id):
+    '''
+    Read triples and map them into ids for multiple relation paths.
+    '''
+    triples = []
+    path_probs = []
+    with open(file_path, 'r') as fin:
+        lines = fin.readlines()
+        
+    for i in range(0,len(lines),2):
+        h, r, t = lines[i].strip().split(' ')
+        meta = lines[i+1].strip().split(' ')
+        # Relation id, probability
+        path_p = []
+        # Relation ids
+        j = 1
+        while j < len(meta):
+            rel_path = []
+            for k in range(1,int(meta[j])+1):
+                rel_path.append(int(meta[j+k]))
+            j = j+k+1
+            path_p.append((rel_path, float(meta[j])))
+            j+=1
+        triples.append((entity2id[h], int(r), entity2id[t]))
+        path_probs.append(path_p)
+    
+    path_confidence = {}
+    with open(conf_path, 'r') as fin:
+        lines = fin.readlines()
+    
+    for i in range(0,len(lines),2):
+        rels = lines[i].strip().split()
+        s = ' '.join(rels[1:])
+        s = s.strip()
+        probs = lines[i+1].strip().split()
+        for j in range(1, len(probs), 2):
+            path_confidence[(s,int(probs[j]))] = float(probs[j+1])
+    
+    return triples, path_probs, path_confidence
+    
 
 def set_logger(args):
     '''
@@ -220,7 +265,10 @@ def main(args):
     logging.info('#entity: %d' % nentity)
     logging.info('#relation: %d' % nrelation)
     
-    train_triples = read_triple(os.path.join(args.data_path, 'train.txt'), entity2id, relation2id)
+    if args.multi_path:
+        train_triples, path_probs, path_confidence = read_triple_multi_path(op.join(args.data_path, 'train_pra.txt'), op.join(args.data_path, 'confidence.txt'), entity2id)
+    else:
+        train_triples = read_triple(os.path.join(args.data_path, 'train.txt'), entity2id, relation2id)
     logging.info('#train: %d' % len(train_triples))
     valid_triples = read_triple(os.path.join(args.data_path, 'valid.txt'), entity2id, relation2id)
     logging.info('#valid: %d' % len(valid_triples))
@@ -253,19 +301,21 @@ def main(args):
     if args.do_train:
         # Set training dataloader iterator
         train_dataloader_head = DataLoader(
-            TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, args.pair_sample_size, 'head-batch'), 
+            TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, args.pair_sample_size, 'head-batch',\
+                         multi_path=(path_probs, path_confidence, args.max_candidate_paths, args.max_path_step) if args.multi_path else None),
             batch_size=args.batch_size,
             shuffle=True, 
             num_workers=max(1, args.cpu_num//2),
-            collate_fn=TrainDataset.collate_fn
+            collate_fn=TrainDataset.collate_fn_multi_path if args.multi_path else TrainDataset.collate_fn
         )
         
         train_dataloader_tail = DataLoader(
-            TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, args.pair_sample_size, 'tail-batch'), 
+            TrainDataset(train_triples, nentity, nrelation, args.negative_sample_size, args.pair_sample_size, 'tail-batch',\
+                         multi_path=(path_probs, path_confidence, args.max_candidate_paths, args.max_path_step) if args.multi_path else None), 
             batch_size=args.batch_size,
             shuffle=True, 
             num_workers=max(1, args.cpu_num//2),
-            collate_fn=TrainDataset.collate_fn
+            collate_fn=TrainDataset.collate_fn_multi_path if args.multi_path else TrainDataset.collate_fn
         )
         
         train_iterator = BidirectionalOneShotIterator(train_dataloader_head, train_dataloader_tail)

@@ -17,6 +17,7 @@ from sklearn.metrics import average_precision_score
 from torch.utils.data import DataLoader
 
 from dataloader import TestDataset
+from tqdm import tqdm
 
 class KGEModel(nn.Module):
     def __init__(self, model_name, nentity, nrelation, hidden_dim, type_dim, gamma, gamma_type, gamma_pair,
@@ -1013,8 +1014,11 @@ class KGEModel(nn.Module):
         model.train()
 
         optimizer.zero_grad()
-
-        positive_sample, negative_sample, subsampling_weight, mode, positive_pair_sample, negative_pair_sample = next(train_iterator)
+        
+        if args.multi_path:
+            positive_sample, negative_sample, subsampling_weight, mode, positive_pair_sample, negative_pair_sample, negative_relation, rel_paths, probs = next(train_iterator)
+        else:
+            positive_sample, negative_sample, subsampling_weight, mode, positive_pair_sample, negative_pair_sample = next(train_iterator)
         '''
         print("positive_sample size:\n{}".format(positive_sample.shape))
         print("negative_sample size:\n{}".format(negative_sample.shape))
@@ -1028,6 +1032,10 @@ class KGEModel(nn.Module):
             subsampling_weight = subsampling_weight.cuda()
             positive_pair_sample = positive_pair_sample.cuda()
             negative_pair_sample = negative_pair_sample.cuda()
+            if args.multi_path:
+                negative_relation = negative_relation.cuda()
+                rel_paths = rel_paths.cuda()
+                probs = probs.cuda()
 
         #print("\nTraining data preparation finished!\n")
 
@@ -1177,7 +1185,7 @@ class KGEModel(nn.Module):
 
             with torch.no_grad():
                 for test_dataset in test_dataset_list:
-                    for positive_sample, negative_sample, filter_bias, mode in test_dataset:
+                    for positive_sample, negative_sample, filter_bias, mode in tqdm(test_dataset):
                         if args.cuda:
                             positive_sample = positive_sample.cuda()
                             negative_sample = negative_sample.cuda()

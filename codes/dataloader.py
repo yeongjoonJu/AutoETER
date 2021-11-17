@@ -10,7 +10,7 @@ import torch
 from torch.utils.data import Dataset
 
 class TrainDataset(Dataset):
-    def __init__(self, triples, nentity, nrelation, negative_sample_size, pair_sample_size, mode):
+    def __init__(self, triples, nentity, nrelation, negative_sample_size, pair_sample_size, mode, multi_path):
         self.len = len(triples)
         self.triples = triples
         self.triple_set = set(triples)
@@ -23,12 +23,17 @@ class TrainDataset(Dataset):
         self.true_head, self.true_tail = self.get_true_head_and_tail(self.triples)
         self.rel_head, self.rel_tail = self.get_relation2headtail(self.triples)
         
+        if multi_path is not None:
+            self.path_probs, self.path_confidence, self.max_n_cand, self.max_steps = multi_path
+            self.multi_path = True
+        else:
+            self.multi_path = False
+        
     def __len__(self):
         return self.len
     
     def __getitem__(self, idx):
         positive_sample = self.triples[idx]
-
         head, relation, tail = positive_sample
 
         subsampling_weight = self.count[(head, relation)] + self.count[(tail, -relation-1)]
@@ -59,10 +64,60 @@ class TrainDataset(Dataset):
             negative_sample_list.append(negative_sample)
             negative_sample_size += negative_sample.size
         
+        if self.multi_path:
+            weak_positive = []
+            rel_paths = []
+            for i in range(len(self.path_probs[idx])):
+                rel_path, prob = self.path_probs[idx][i]
+                path_str = ' '.join(map(str, rel_path))
+                weak_positive += rel_path
+                
+                confidence = 0.0
+                if (path_str, relation) in self.path_confidence:
+                    confidence = self.path_confidence[(path_str, relation)]
+                confidence = 0.99*confidence + 0.01
+                reliability = prob*confidence
+                rel_paths.append(rel_path + [reliability])
+            rel_paths.sort(key=lambda x: x[-1], reverse=True)
+            
+            rel_paths_for_batch = []
+            probs_for_batch = []
+            if len(rel_paths)==0:
+                rel_paths_for_batch = torch.zeros(self.max_n_cand, self.max_steps) - 1
+                probs_for_batch = torch.zeros(self.max_n_cand)
+            else:
+                for i in range(min(len(rel_paths), self.max_n_cand)):
+                    probs_for_batch.append(rel_paths[i][-1])
+                    rel_path = rel_paths[i][:-1]
+                    if len(rel_path) < self.max_steps:
+                        rel_path += [-1]*(self.max_steps - len(rel_path))
+                    elif len(rel_path) > self.max_steps:
+                        rel_path = rel_path[:self.max_steps]
+                    rel_paths_for_batch.append(rel_path)
+                
+                if len(rel_paths_for_batch) != self.max_n_cand:
+                    rel_paths_for_batch += [[-1]*self.max_steps]*(self.max_n_cand-len(rel_paths_for_batch))
+                    probs_for_batch += [0.0]*(self.max_n_cand-len(probs_for_batch))
+                    
+                rel_paths_for_batch = torch.LongTensor(np.array(rel_paths_for_batch))
+                probs_for_batch = torch.from_numpy(np.array(probs_for_batch))
+                
+            # Negative relation sampling
+            while True:
+                negative_relation = np.random.randint(self.nrelation, size=4)
+                mask = np.in1d(
+                    negative_relation,
+                    np.array(list(set([relation] + weak_positive))),
+                    assume_unique=True,
+                    invert=True,
+                )
+                negative_relation = negative_relation[mask]
+                if np.sum(mask) >= 1:
+                    break
+            negative_relation = torch.from_numpy(negative_relation[:1])
+                    
         negative_sample = np.concatenate(negative_sample_list)[:self.negative_sample_size]
-
         negative_sample = torch.from_numpy(negative_sample)
-        
         positive_sample = torch.LongTensor(positive_sample)
 
         negative_pair_list = []
@@ -179,6 +234,9 @@ class TrainDataset(Dataset):
         '''
         positive_pair_sample = torch.from_numpy(positive_pair_sample)
         #print("positive_pair_sample: {}".format(positive_pair_sample))
+        
+        if self.multi_path:
+            return positive_sample, negative_sample, subsampling_weight, self.mode, positive_pair_sample, negative_pair_sample, negative_relation, rel_paths_for_batch, probs_for_batch
 
         return positive_sample, negative_sample, subsampling_weight, self.mode, positive_pair_sample, negative_pair_sample
     
@@ -190,7 +248,23 @@ class TrainDataset(Dataset):
         mode = data[0][3]
         positive_pair_sample = torch.stack([_[4] for _ in data], dim=0)
         negative_pair_sample = torch.stack([_[5] for _ in data], dim=0)
+        
         return positive_sample, negative_sample, subsample_weight, mode, positive_pair_sample, negative_pair_sample
+    
+    @staticmethod
+    def collate_fn_multi_path(data):
+        positive_sample = torch.stack([_[0] for _ in data], dim=0)
+        negative_sample = torch.stack([_[1] for _ in data], dim=0)
+        subsample_weight = torch.cat([_[2] for _ in data], dim=0)
+        mode = data[0][3]
+        positive_pair_sample = torch.stack([_[4] for _ in data], dim=0)
+        negative_pair_sample = torch.stack([_[5] for _ in data], dim=0)
+        
+        negative_relation = torch.stack([_[6] for _ in data], dim=0)
+        rel_paths = torch.stack([_[7] for _ in data], dim=0)
+        probs = torch.stack([_[8] for _ in data], dim=0)
+        
+        return positive_sample, negative_sample, subsample_weight, mode, positive_pair_sample, negative_pair_sample, negative_relation, rel_paths, probs
     
     @staticmethod
     def count_frequency(triples, start=4):
